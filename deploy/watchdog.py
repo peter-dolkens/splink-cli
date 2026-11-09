@@ -15,6 +15,9 @@ every five minutes for as long as HA was down. The two cases are told apart like
 
   bridge unreachable on loopback  -> our USB/serial is gone. Nothing upstream can cause this.
                                      Reset the USB device, then reboot if that fails.
+  bridge answers, readings fail   -> a software fault inside the bridge: the link and the
+                                     network are fine, so restart the bridge service -- not
+                                     the USB device, not the machine. Rate limited.
   bridge fine, MQTT stale         -> look at the default gateway. Unreachable means our own
                                      network is gone (the same wedge, other half) and a reboot
                                      is warranted. Reachable means the fault is upstream --
@@ -31,12 +34,14 @@ capturing it at fault time preserves the part that matters without journald writ
 card continuously. One gzipped file per fault, newest twenty kept.
 """
 import fcntl
+import json
 import os
 import signal
 import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 BRIDGE = os.environ.get("BRIDGE_URL", "http://localhost:8080")
@@ -52,6 +57,14 @@ USB_RESET_AFTER = int(os.environ.get("USB_RESET_AFTER", "120"))
 # A reboot every half hour at worst. If we are rebooting that often the fault is not one a
 # reboot fixes, and continuing would just shred the logs that would show what it is.
 MIN_REBOOT_GAP = int(os.environ.get("MIN_REBOOT_GAP", "1800"))
+# A fault can leave /fast answering while every full reading fails. That cost 6.5 hours on
+# 2026-10-12: after a reconnect, a stale handle inside the bridge failed every full read with
+# "The port is closed.", the bridge served 503s, nothing reached MQTT, and this watchdog --
+# looking only at /fast -- kept reporting that the inverter read fine. The serial link and the
+# network were healthy, so the remedy is restarting the bridge service. Rate limited, so a
+# fault a restart cannot fix costs one restart per gap rather than a loop on the inverter link.
+RESTART_GAP = int(os.environ.get("RESTART_GAP", "1800"))
+SPLINK_UNIT = os.environ.get("SPLINK_UNIT", "splink")
 DIAG_DIR = os.environ.get("WATCHDOG_DIAG_DIR", "/var/lib/splink/diagnostics")
 DIAG_KEEP = int(os.environ.get("WATCHDOG_DIAG_KEEP", "20"))
 # A slow leak is invisible in a spot check and obvious in a trend, and the journal here is
@@ -81,6 +94,35 @@ def bridge_alive():
             return r.status == 200
     except Exception:
         return False
+
+
+def bridge_problem():
+    """None if full readings work, otherwise what the bridge says is wrong with them.
+
+    /health runs the same full read the publisher depends on, so it catches faults that leave
+    /fast working. It is served from the bridge's short cache and interval-gated reads, so
+    asking once a minute adds next to nothing on the inverter link.
+    """
+    try:
+        req = urllib.request.Request(BRIDGE.rstrip("/") + "/health",
+                                     headers={"User-Agent": "splink-watchdog"})
+        with urllib.request.urlopen(req, timeout=30):
+            return None
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read()).get("sp_pro") or f"HTTP {e.code}"
+        except Exception:
+            return f"HTTP {e.code}"
+    except Exception as e:
+        return f"health check failed: {e}"
+
+
+def restart_bridge(why):
+    capture(f"restarting {SPLINK_UNIT}: {why}")
+    log(f"RESTARTING {SPLINK_UNIT}: {why}")
+    r = subprocess.run(["systemctl", "restart", SPLINK_UNIT], capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"restart of {SPLINK_UNIT} failed ({r.returncode}): {r.stderr.strip()}")
 
 
 def mqtt_fresh():
@@ -310,12 +352,16 @@ def main():
     signal.signal(signal.SIGINT, stop)
 
     log(f"watchdog up: checking every {CHECK_EVERY}s, acting after {FAIL_SECONDS}s of fault "
-        f"(USB reset at {USB_RESET_AFTER}s), minimum {MIN_REBOOT_GAP / 60:.0f} min between reboots; "
+        f"(USB reset at {USB_RESET_AFTER}s), minimum {MIN_REBOOT_GAP / 60:.0f} min between reboots, "
+        f"{RESTART_GAP / 60:.0f} min between {SPLINK_UNIT} restarts; "
         f"resource sample every {SAMPLE_EVERY}s to {SAMPLE_FILE}")
 
     bridge_bad_since = None
     mqtt_bad_since = None
     reset_tried = False
+    degraded_since = None
+    last_restart = None
+    hold_logged = False
     last_sample = 0.0
 
     while running:
@@ -340,6 +386,35 @@ def main():
                 usb_reset()
                 reset_tried = True
 
+        # The bridge answers, but can it still produce a full reading? Only asked while /fast
+        # works; if it does not, the branch above owns the fault.
+        problem = None
+        if bridge_bad_since is None:
+            problem = bridge_problem()
+            if problem is None:
+                if degraded_since:
+                    via = " (after a restart)" if last_restart and last_restart >= degraded_since else ""
+                    log(f"bridge readings recovered after {now - degraded_since:.0f}s{via}")
+                degraded_since, hold_logged = None, False
+            else:
+                degraded_since = degraded_since or now
+                bad = now - degraded_since
+                if bad >= FAIL_SECONDS:
+                    if last_restart is not None and now - last_restart < RESTART_GAP:
+                        if not hold_logged:
+                            log(f"bridge readings failing for {bad:.0f}s ({problem}) but "
+                                f"{SPLINK_UNIT} was restarted {(now - last_restart) / 60:.0f} min ago "
+                                f"(minimum gap {RESTART_GAP / 60:.0f} min) -- holding")
+                            hold_logged = True
+                    else:
+                        restart_bridge(f"/fast answers but full readings have failed for "
+                                       f"{bad:.0f}s: {problem}")
+                        last_restart, hold_logged = now, False
+                        # degraded_since is kept, so recovery is logged against the fault's start;
+                        # RESTART_GAP alone stops a second restart before this one has had time.
+        else:
+            degraded_since = None
+
         # Only meaningful while the bridge itself is fine; otherwise the branch above owns it.
         if bridge_bad_since is None:
             if mqtt_fresh():
@@ -351,8 +426,12 @@ def main():
                 stale = now - mqtt_bad_since
                 if stale >= FAIL_SECONDS:
                     if gateway_reachable():
-                        log(f"MQTT stale {stale:.0f}s but the gateway answers and the inverter "
-                            f"reads fine -- the fault is upstream (tunnel/broker/HA). Not rebooting.")
+                        if problem:
+                            log(f"MQTT stale {stale:.0f}s because the bridge's readings are failing "
+                                f"({problem}) -- the bridge restart handles that. Not rebooting.")
+                        else:
+                            log(f"MQTT stale {stale:.0f}s but the gateway answers and the inverter "
+                                f"reads fine -- the fault is upstream (tunnel/broker/HA). Not rebooting.")
                     else:
                         reboot(f"MQTT stale {stale:.0f}s and the default gateway is unreachable")
 
