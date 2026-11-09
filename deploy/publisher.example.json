@@ -23,6 +23,19 @@
     "               zero and has never moved, and the inverter's own configuration says the",
     "               hardware is absent. Delete a line to bring that group back.",
     "",
+    "",
+    "targets        where to publish. Omit it and the single broker from MQTT_ENV is used,",
+    "               which is what every existing install does. Each entry is:",
+    "                 {\"name\": \"...\", \"env\": \"/etc/splink/<name>.env\"}",
+    "               and may override \"host\"/\"port\". Credentials come from the env file, never",
+    "               from here: this file is site configuration and a broker password does not",
+    "               belong in it. Each target gets its own connection, its own discovery",
+    "               announcement and its own record of what it was last sent -- that last part",
+    "               matters, because a shared record would let a target that was disconnected",
+    "               when a value changed miss it permanently.",
+    "               A target that cannot be read or reached is skipped with a warning rather",
+    "               than taking the others down.",
+    "",
     "quantize       per-entity rounding as {object_id_glob: decimal_places}. Empty means",
     "               raw readings go out untouched, which is the default."
   ],
@@ -114,5 +127,11 @@
     "<block twins of curated sensors>": "29 entities. Every curated sensor reads a register the block sweep also reads, so each had a raw twin under a different grouping -- battery_soc alongside now_batt_soc_percent, and so on. Matched by register rather than by value, since zeros collide. The curated one is kept: it has the better name, the right device class, and sits on a topic matching how fast the reading actually moves.",
     "sp_pro_inverter_run_hours_today, sp_pro_technical_inverter_run_hrs_total_acc": "Superseded by a single sp_pro_inverter_hours promoted from Technical.InverterRunHrsTotalAcc. One lifetime counter per inverter is enough to show it has not been down; a daily figure resets and would hide a gap."
   },
-  "quantize": {}
+  "quantize": {},
+  "targets": [
+    {
+      "name": "home-assistant",
+      "env": "/etc/splink/mqtt.env"
+    }
+  ]
 }

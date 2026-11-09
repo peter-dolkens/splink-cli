@@ -55,11 +55,12 @@ DISCOVERY = "homeassistant"
 HEARTBEAT = os.environ.get("MQTT_HEARTBEAT", "/run/splink/mqtt-ok")
 
 running = True
-_last_sent: dict[str, str] = {}
-_last_published: dict[str, float] = {}
+# Per-topic send records moved into Target: see the note there on why they cannot be shared.
 _last_forced = 0.0
-_credentials = ("", "")
-_host, _port = "127.0.0.1", 1883
+# When the blocks bucket was last published, which decides whether to ask the bridge for the
+# 102 KB block payload at all. Tracked here rather than per target: it is a question about what
+# to fetch, and fetching once serves every target.
+_blocks_published_at = 0.0
 
 
 def load_env(path):
@@ -498,21 +499,110 @@ def heartbeat():
         pass
 
 
-def publish_if_due(client, topic, payload, bucket, force):
-    """Publish when the bucket's interval has elapsed and the payload actually changed."""
-    now = time.time()
-    if not force:
-        if now - _last_published.get(topic, 0) < BUCKETS.get(bucket, 0):
-            return 0
-        if _last_sent.get(topic) == payload:
-            return 0
-    client.publish(topic, payload, retain=True)
-    _last_sent[topic] = payload
-    _last_published[topic] = now
-    return 1
+class Target:
+    """One publish destination: its own broker connection and its own de-duplication state.
+
+    The state has to be per-target. With a single shared record of what was last sent, a target
+    that happened to be disconnected when a value changed would never receive that value -- the
+    next identical payload would be suppressed as a duplicate and the target would sit on a
+    stale retained message indefinitely. Keeping the record per-target costs a dictionary and
+    removes that whole class of bug.
+
+    Adding a destination that is not MQTT means writing a class with the same four methods --
+    connect, publish, publish_if_due and announce -- and returning it from build_targets. The
+    publishing code above calls nothing else.
+    """
+
+    def __init__(self, name, host, port, username, password):
+        self.name = name
+        self.host, self.port = host, port
+        # Kept for the retirement probe, which needs a second connection to this same broker.
+        self.username, self.password = username, password
+        self.connected = False
+        self._last_sent = {}
+        self._last_published = {}
+        self._discovery = []
+        # Distinct client_id per target: brokers evict an existing session when a second
+        # connection claims the same id, so sharing one would make two targets fight.
+        self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                   client_id=f"solar-bridge-{name}")
+        self._client.username_pw_set(username, password)
+        self._client.will_set(f"{PREFIX}/status", "offline", retain=True)
+        self._client.on_connect = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
+
+    def _on_connect(self, client, _userdata, _flags, reason, _props=None):
+        """Re-announce on every connect, not just the first.
+
+        A dropped link makes the broker publish our retained last-will, so Home Assistant sees
+        "offline". paho reconnects by itself, but unless we say "online" again nothing clears
+        that, and the entities stay unavailable while we publish state into the void.
+        """
+        if reason != 0:
+            print(f"[{self.name}] connect failed: {reason}", file=sys.stderr, flush=True)
+            return
+        self.connected = True
+        for topic, cfg in self._discovery:
+            client.publish(topic, json.dumps(cfg), retain=True)
+        client.publish(f"{PREFIX}/status", "online", retain=True)
+        # Everything is resent after a reconnect: this broker may have been restarted and lost
+        # its retained messages, and we cannot tell from here.
+        self._last_sent.clear()
+        self._last_published.clear()
+        print(f"[{self.name}] connected: announced {len(self._discovery)} discovery configs",
+              flush=True)
+
+    def _on_disconnect(self, _client, _userdata, *args):
+        self.connected = False
+        print(f"[{self.name}] disconnected", file=sys.stderr, flush=True)
+
+    def connect(self):
+        self._client.connect(self.host, self.port, keepalive=60)
+        self._client.loop_start()
+
+    def announce(self, discovery):
+        """Remember the entity set and publish it, so a later reconnect can replay it."""
+        self._discovery = discovery
+        for topic, cfg in discovery:
+            self._client.publish(topic, json.dumps(cfg), retain=True)
+
+    def publish(self, topic, payload, retain=True):
+        self._client.publish(topic, payload, retain=retain)
+
+    def publish_if_due(self, topic, payload, bucket, force):
+        """Publish when the bucket's interval has elapsed and the payload actually changed."""
+        now = time.time()
+        if not force:
+            if now - self._last_published.get(topic, 0) < BUCKETS.get(bucket, 0):
+                return 0
+            if self._last_sent.get(topic) == payload:
+                return 0
+        self._client.publish(topic, payload, retain=True)
+        self._last_sent[topic] = payload
+        self._last_published[topic] = now
+        return 1
+
+    def stop(self):
+        self._client.publish(f"{PREFIX}/status", "offline", retain=True)
+        self._client.loop_stop()
+        self._client.disconnect()
+
+    @property
+    def client(self):
+        """For the one caller that needs the raw client: stale-discovery retirement."""
+        return self._client
 
 
-def publish_fast(client, routes, force):
+def publish_if_due(targets, topic, payload, bucket, force):
+    """Fan a payload out to every target. Returns how many actually sent it.
+
+    A target that suppresses the payload as unchanged is not a failure, so the count is used
+    only for the hourly summary.
+    """
+    return sum(t.publish_if_due(topic, payload, bucket, force) for t in targets)
+
+
+def publish_fast(targets, routes, force):
     """One poll of the bridge's fast window, published to its own topic.
 
     Runs on its own thread so its cadence is independent of the main loop: a slow block sweep
@@ -526,11 +616,11 @@ def publish_fast(client, routes, force):
     payload = {}
     for object_id, path in routes[FAST_BUCKET]:
         put(payload, path, quantize(object_id, fast.get(path)))
-    return publish_if_due(client, f"{SPPRO_BASE}/{FAST_BUCKET}",
+    return publish_if_due(targets, f"{SPPRO_BASE}/{FAST_BUCKET}",
                           json.dumps(payload, sort_keys=True), FAST_BUCKET, force)
 
 
-def fast_loop(client, state):
+def fast_loop(targets, state):
     """Poll the fast window until shutdown, once the entity set exists."""
     last_forced, fails = 0.0, 0
     while running:
@@ -540,7 +630,7 @@ def fast_loop(client, state):
                 force = time.time() - last_forced >= FORCE_EVERY
                 if force:
                     last_forced = time.time()
-                publish_fast(client, routes, force)
+                publish_fast(targets, routes, force)
                 if fails:
                     print(f"fast path recovered after {fails} failures", flush=True)
                     fails = 0
@@ -554,7 +644,7 @@ def fast_loop(client, state):
         time.sleep(FAST_INTERVAL)
 
 
-def retire_stale_discovery(client, keep):
+def retire_stale_discovery(target, keep):
     """Clear retained discovery configs we no longer publish.
 
     The topic layout changed, so configs left at the previous addresses would keep their
@@ -575,13 +665,13 @@ def retire_stale_discovery(client, keep):
             stale.append(m.topic)
 
     probe = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="solar-bridge-retire")
-    probe.username_pw_set(*_credentials)
+    probe.username_pw_set(target.username, target.password)
     probe.on_message = consider
     # Both the old three-level layout and the current four-level one.
     probe.on_connect = lambda c, _u, _f, _r, _p=None: (c.subscribe(f"{DISCOVERY}/+/+/config"),
                                                        c.subscribe(f"{DISCOVERY}/+/+/+/config"))
     try:
-        probe.connect(_host, _port, 30)
+        probe.connect(target.host, target.port, 30)
         probe.loop_start()
         time.sleep(8)
         probe.loop_stop()
@@ -600,39 +690,55 @@ def retire_stale_discovery(client, keep):
     return len(stale)
 
 
-def main():
-    global _credentials, _host, _port, _last_forced
-    conf = load_env(CONF)
-    _credentials = (conf["MQTT_USERNAME"], conf["MQTT_PASSWORD"])
-    _host = conf.get("MQTT_HOST", "127.0.0.1")
-    _port = int(conf.get("MQTT_PORT", "1883"))
+def build_targets():
+    """Every destination to publish to, from config.
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="solar-bridge")
-    client.username_pw_set(*_credentials)
-    client.will_set(f"{PREFIX}/status", "offline", retain=True)
+    Each target names an env file for its credentials rather than carrying them in
+    publisher.json: that file is site configuration under version control's nose, and a broker
+    password does not belong in it. With no "targets" key the single broker from MQTT_ENV is
+    used, which is what every existing install has.
+    """
+    declared = CFG.get("targets") or [{"name": "home-assistant", "env": CONF}]
+    targets = []
+    for spec in declared:
+        name = spec.get("name") or "target"
+        env_path = spec.get("env", CONF)
+        try:
+            conf = load_env(env_path)
+        except OSError as e:
+            # A broken second target must not take down the first.
+            print(f"[{name}] skipped: cannot read {env_path}: {e}", file=sys.stderr, flush=True)
+            continue
+        host = spec.get("host") or conf.get("MQTT_HOST", "127.0.0.1")
+        port = int(spec.get("port") or conf.get("MQTT_PORT", "1883"))
+        user = conf.get("MQTT_USERNAME", "")
+        password = conf.get("MQTT_PASSWORD", "")
+        if not user and not password:
+            print(f"[{name}] warning: no credentials in {env_path}", file=sys.stderr, flush=True)
+        targets.append(Target(name, host, port, user, password))
+    return targets
+
+
+def main():
+    global _last_forced, _blocks_published_at
+
+    targets = build_targets()
+    if not targets:
+        print("no usable publish targets; nothing to do", file=sys.stderr, flush=True)
+        return 1
 
     state = {"discovery": [], "routes": None, "retired": False}
 
-    def on_connect(_client, _userdata, _flags, reason, _props=None):
-        """Re-announce on every connect, not just the first.
-
-        A dropped link makes the broker publish our retained last-will, so Home Assistant sees
-        "offline". paho reconnects by itself, but unless we say "online" again nothing clears
-        that, and the entities stay unavailable while we publish state into the void.
-        """
-        if reason != 0:
-            print(f"connect failed: {reason}", file=sys.stderr, flush=True)
-            return
-        for topic, cfg in state["discovery"]:
-            _client.publish(topic, json.dumps(cfg), retain=True)
-        _client.publish(f"{PREFIX}/status", "online", retain=True)
-        _last_sent.clear()
-        _last_published.clear()
-        print(f"connected: announced {len(state['discovery'])} discovery configs", flush=True)
-
-    client.on_connect = on_connect
-    client.connect(_host, _port, keepalive=60)
-    client.loop_start()
+    for target in targets:
+        try:
+            target.connect()
+        except OSError as e:
+            # Keep going: paho retries in the background, and one unreachable broker should not
+            # stop the others from being fed.
+            print(f"[{target.name}] initial connect to {target.host}:{target.port} failed: {e}",
+                  file=sys.stderr, flush=True)
+    print(f"publishing to {len(targets)} target(s): "
+          + ", ".join(f"{t.name} ({t.host}:{t.port})" for t in targets), flush=True)
 
     def stop(*_):
         global running
@@ -641,7 +747,7 @@ def main():
     signal.signal(signal.SIGINT, stop)
 
     if FAST_INTERVAL:
-        threading.Thread(target=fast_loop, args=(client, state), daemon=True).start()
+        threading.Thread(target=fast_loop, args=(targets, state), daemon=True).start()
         print(f"fast path: {len(FAST_FIELDS)} readings every {FAST_INTERVAL}s "
               f"on {SPPRO_BASE}/{FAST_BUCKET}", flush=True)
 
@@ -653,7 +759,7 @@ def main():
             # when the blocks bucket is due to publish.
             blocks_topic = f"{SPPRO_BASE}/blocks"
             want_blocks = (state["routes"] is None
-                           or time.time() - _last_published.get(blocks_topic, 0)
+                           or time.time() - _blocks_published_at
                            >= BUCKETS.get("blocks", 0))
             url = BRIDGE + ("?blocks=true" if want_blocks else "")
             req = urllib.request.Request(url, headers={"User-Agent": "solar-bridge-mqtt"})
@@ -665,14 +771,16 @@ def main():
             if state["routes"] is None and sp:
                 discovery, routes = build_entities(snap)
                 state["discovery"], state["routes"] = discovery, routes
-                for topic, cfg in discovery:
-                    client.publish(topic, json.dumps(cfg), retain=True)
+                for target in targets:
+                    target.announce(discovery)
                 if not state["retired"]:
                     # After announcing, not before: the scan then sees a settled broker that
                     # already holds everything we intend to keep, so whatever is left over is
                     # unambiguously stale. Scanning first raced our own publishes and once left
                     # a retired entity alive.
-                    retire_stale_discovery(client, {t for t, _ in discovery})
+                    # Each broker holds its own retained configs, so each needs its own sweep.
+                    for target in targets:
+                        retire_stale_discovery(target, {t for t, _ in discovery})
                     state["retired"] = True
                 counts = ", ".join(f"{b}={len(v)}" for b, v in routes.items())
                 print(f"announced {len(discovery)} entities ({counts})", flush=True)
@@ -695,8 +803,10 @@ def main():
                         # Publishing from an absent sweep would overwrite good values with nulls.
                         continue
                     topics += 1
+                    if bucket == "blocks":
+                        _blocks_published_at = time.time()
                     payload = bucket_payload(sp, blocks_flat, state["routes"], bucket)
-                    sent += publish_if_due(client, f"{SPPRO_BASE}/{bucket}",
+                    sent += publish_if_due(targets, f"{SPPRO_BASE}/{bucket}",
                                            json.dumps(payload, sort_keys=True), bucket, force)
 
             for f in snap.get("fronius") or []:
@@ -704,24 +814,29 @@ def main():
                 if isinstance(g.get("status"), dict):
                     g["status"] = {k: v for k, v in g["status"].items() if k != "device_time"}
                 topics += 1
-                sent += publish_if_due(client, f"{PREFIX}/fronius/{f['name']}/state",
+                sent += publish_if_due(targets, f"{PREFIX}/fronius/{f['name']}/state",
                                        json.dumps(g, sort_keys=True), "state", force)
             published += sent
             skipped += topics - sent
 
             if fails:
                 print(f"bridge recovered after {fails} failures", flush=True)
-                client.publish(f"{PREFIX}/status", "online", retain=True)
+                for target in targets:
+                    target.publish(f"{PREFIX}/status", "online")
             fails = 0
             # Only meaningful if the broker is actually there -- paho queues silently while
             # disconnected, so a publish call returning is not evidence of anything.
-            if client.is_connected():
+            # The heartbeat means "we reached at least one broker". The watchdog uses it to
+            # decide whether the publish path works at all; one dead target out of two is a
+            # problem for that target's consumer, not a reason to restart anything here.
+            if any(t.connected for t in targets):
                 heartbeat()
         except Exception as e:
             fails += 1
             print(f"bridge read failed ({fails}): {e}", file=sys.stderr, flush=True)
             if fails >= 2:
-                client.publish(f"{PREFIX}/status", "offline", retain=True)
+                for target in targets:
+                    target.publish(f"{PREFIX}/status", "offline")
 
         if time.time() - last_report >= 3600:
             print(f"last hour: {published} publishes, {skipped} skipped", flush=True)
@@ -733,9 +848,8 @@ def main():
                 break
             time.sleep(1)
 
-    client.publish(f"{PREFIX}/status", "offline", retain=True)
-    client.loop_stop()
-    client.disconnect()
+    for target in targets:
+        target.stop()
     return 0
 
 
