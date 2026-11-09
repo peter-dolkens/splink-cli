@@ -13,15 +13,16 @@ is not enough of a reason: the broker is remote, through a tunnel, so an ordinar
 Assistant restart would look identical to a local fault and we would reboot the solar bridge
 every five minutes for as long as HA was down. The two cases are told apart like this:
 
-  bridge unreachable on loopback  -> our USB/serial is gone. Nothing upstream can cause this.
-                                     Reset the USB device, then reboot if that fails.
+  bridge unreachable on loopback  -> our USB/serial is gone. Nothing upstream can cause this,
+                                     and only a reboot clears it -- see USB_RESET_AFTER.
   bridge answers, readings fail   -> a software fault inside the bridge: the link and the
                                      network are fine, so restart the bridge service -- not
                                      the USB device, not the machine. Rate limited.
-  bridge fine, MQTT stale         -> look at the default gateway. Unreachable means our own
-                                     network is gone (the same wedge, other half) and a reboot
-                                     is warranted. Reachable means the fault is upstream --
-                                     the tunnel, the broker, or HA itself -- so log and wait.
+  bridge fine, MQTT stale         -> restart the publish path first, then look at the default
+                                     gateway. Unreachable means our own network is gone (the
+                                     same wedge, other half) and a reboot is warranted.
+                                     Reachable means the fault is beyond this machine -- the
+                                     broker or HA itself -- so log and wait.
 
 Reboots are rate limited regardless, because a reboot loop is worse than being down: it would
 destroy the on-disk block log and make the real cause harder to find.
@@ -52,8 +53,22 @@ CHECK_EVERY = int(os.environ.get("CHECK_EVERY", "60"))
 # How long a fault must persist before we act. The bridge's own read schedule is slower than
 # the check interval, so a single miss means nothing.
 FAIL_SECONDS = int(os.environ.get("FAIL_SECONDS", "300"))
-# Try the cheap fix first; only escalate if it does not take.
-USB_RESET_AFTER = int(os.environ.get("USB_RESET_AFTER", "120"))
+# Issuing USBDEVFS_RESET before rebooting was the original plan, on the assumption that a reset
+# clears this wedge. The kernel says otherwise. From the 2026-10-29 snapshot:
+#
+#   WARN::dwc_otg_hcd_urb_dequeue:639: Timed out waiting for FSM NP transfer to complete  (x157)
+#   usb 1-1-port3: cannot reset (err = -110)
+#   ls: cannot access '/dev/ttyACM0': No such file or directory
+#
+# The reset path is itself timing out: -110 is ETIMEDOUT, and port 3 is where the SP PRO sits.
+# A reset cannot succeed when the controller's transfer state machine is the thing that is
+# wedged, which is why 2026-10-27 and 2026-10-29 both escalated to a reboot anyway. Attempting
+# it only delays the one remedy that works, so it is off by default. Set it above zero to try
+# again on a kernel where dwc_otg behaves differently.
+USB_RESET_AFTER = int(os.environ.get("USB_RESET_AFTER", "0"))
+# With no reset to attempt there is nothing to wait for, so the loopback fault reboots sooner
+# than the other classes. Two minutes is still long enough to ride out a slow block sweep.
+LOOPBACK_FAIL_SECONDS = int(os.environ.get("LOOPBACK_FAIL_SECONDS", "120"))
 # A reboot every half hour at worst. If we are rebooting that often the fault is not one a
 # reboot fixes, and continuing would just shred the logs that would show what it is.
 MIN_REBOOT_GAP = int(os.environ.get("MIN_REBOOT_GAP", "1800"))
@@ -65,6 +80,16 @@ MIN_REBOOT_GAP = int(os.environ.get("MIN_REBOOT_GAP", "1800"))
 # fault a restart cannot fix costs one restart per gap rather than a loop on the inverter link.
 RESTART_GAP = int(os.environ.get("RESTART_GAP", "1800"))
 SPLINK_UNIT = os.environ.get("SPLINK_UNIT", "splink")
+# The publish path, in the order it has to come up: the tunnel carries the broker connection,
+# and the publisher sits on top of it.
+#
+# Waiting on the gateway test alone was wrong. On 2026-10-16 and 2026-10-20 publishing stopped
+# for 9.8 and 12.4 hours while the gateway stayed reachable, so this declined to reboot -- which
+# was correct, and the block logs for both days are full size, proving the bridge was reading
+# the inverter the whole time. But declining to reboot was all it did. The fault was the tunnel
+# or the publisher's broker connection, and a restart of those two is the remedy neither tier
+# was offering.
+MQTT_UNITS = [u for u in os.environ.get("MQTT_UNITS", "mqtt-tunnel,mqtt-publish").split(",") if u]
 DIAG_DIR = os.environ.get("WATCHDOG_DIAG_DIR", "/var/lib/splink/diagnostics")
 DIAG_KEEP = int(os.environ.get("WATCHDOG_DIAG_KEEP", "20"))
 # A slow leak is invisible in a spot check and obvious in a trend, and the journal here is
@@ -115,6 +140,17 @@ def bridge_problem():
             return f"HTTP {e.code}"
     except Exception as e:
         return f"health check failed: {e}"
+
+
+def restart_units(units, why):
+    """Restart a list of services in order, newest fault captured first."""
+    capture(f"restarting {', '.join(units)}: {why}")
+    for unit in units:
+        r = subprocess.run(["systemctl", "restart", unit], capture_output=True, text=True)
+        if r.returncode != 0:
+            log(f"restart of {unit} failed ({r.returncode}): {r.stderr.strip()}")
+        else:
+            log(f"restarted {unit}")
 
 
 def restart_bridge(why):
@@ -351,10 +387,15 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    log(f"watchdog up: checking every {CHECK_EVERY}s, acting after {FAIL_SECONDS}s of fault "
-        f"(USB reset at {USB_RESET_AFTER}s), minimum {MIN_REBOOT_GAP / 60:.0f} min between reboots, "
-        f"{RESTART_GAP / 60:.0f} min between {SPLINK_UNIT} restarts; "
-        f"resource sample every {SAMPLE_EVERY}s to {SAMPLE_FILE}")
+    reset_note = (f"USB reset attempted at {USB_RESET_AFTER}s" if USB_RESET_AFTER > 0
+                  else "no USB reset -- the kernel cannot reset this wedge")
+    log(f"watchdog up: checking every {CHECK_EVERY}s. "
+        f"Loopback fault: reboot after {LOOPBACK_FAIL_SECONDS}s ({reset_note}). "
+        f"Degraded readings or stale MQTT: act after {FAIL_SECONDS}s. "
+        f"Restarts: {SPLINK_UNIT} for degraded readings, {', '.join(MQTT_UNITS)} for stale MQTT, "
+        f"at most one per {RESTART_GAP / 60:.0f} min each. "
+        f"Reboots at most one per {MIN_REBOOT_GAP / 60:.0f} min. "
+        f"Resource sample every {SAMPLE_EVERY}s to {SAMPLE_FILE}.")
 
     bridge_bad_since = None
     mqtt_bad_since = None
@@ -362,6 +403,8 @@ def main():
     degraded_since = None
     last_restart = None
     hold_logged = False
+    last_mqtt_restart = None
+    mqtt_hold_logged = False
     last_sample = 0.0
 
     while running:
@@ -378,9 +421,9 @@ def main():
         else:
             bridge_bad_since = bridge_bad_since or now
             down = now - bridge_bad_since
-            if down >= FAIL_SECONDS:
+            if down >= LOOPBACK_FAIL_SECONDS:
                 reboot(f"bridge unreachable on loopback for {down:.0f}s")
-            elif down >= USB_RESET_AFTER and not reset_tried:
+            elif USB_RESET_AFTER > 0 and down >= USB_RESET_AFTER and not reset_tried:
                 log(f"bridge unreachable for {down:.0f}s -- capturing, then trying a USB reset")
                 capture(f"bridge unreachable on loopback for {down:.0f}s")
                 usb_reset()
@@ -419,21 +462,39 @@ def main():
         if bridge_bad_since is None:
             if mqtt_fresh():
                 if mqtt_bad_since:
-                    log(f"MQTT publishing recovered after {now - mqtt_bad_since:.0f}s")
-                mqtt_bad_since = None
+                    via = " (after a restart)" if last_mqtt_restart and last_mqtt_restart >= mqtt_bad_since else ""
+                    log(f"MQTT publishing recovered after {now - mqtt_bad_since:.0f}s{via}")
+                mqtt_bad_since, mqtt_hold_logged = None, False
             else:
                 mqtt_bad_since = mqtt_bad_since or now
                 stale = now - mqtt_bad_since
                 if stale >= FAIL_SECONDS:
-                    if gateway_reachable():
-                        if problem:
+                    if problem:
+                        # A bridge-level fault starves the publisher of data. Its own tier owns
+                        # the remedy; restarting the publish path here would fix nothing.
+                        if not mqtt_hold_logged:
                             log(f"MQTT stale {stale:.0f}s because the bridge's readings are failing "
-                                f"({problem}) -- the bridge restart handles that. Not rebooting.")
-                        else:
-                            log(f"MQTT stale {stale:.0f}s but the gateway answers and the inverter "
-                                f"reads fine -- the fault is upstream (tunnel/broker/HA). Not rebooting.")
-                    else:
+                                f"({problem}) -- the bridge restart handles that.")
+                            mqtt_hold_logged = True
+                    elif not gateway_reachable():
+                        # Our own network is gone, which is the other half of the USB wedge.
+                        # Restarting the tunnel cannot help when the interface is dead.
                         reboot(f"MQTT stale {stale:.0f}s and the default gateway is unreachable")
+                    elif last_mqtt_restart is None or now - last_mqtt_restart >= RESTART_GAP:
+                        # The gateway answers and the inverter reads fine, so what is broken is
+                        # between here and the broker: the tunnel, or the publisher's connection
+                        # to it. Restart both rather than waiting for it to cure itself, which is
+                        # what cost 9.8 and 12.4 hours in October.
+                        restart_units(MQTT_UNITS,
+                                      f"MQTT stale {stale:.0f}s; gateway answers and the bridge "
+                                      f"reads fine, so the publish path is the fault")
+                        last_mqtt_restart, mqtt_hold_logged = now, False
+                    elif not mqtt_hold_logged:
+                        log(f"MQTT stale {stale:.0f}s but {', '.join(MQTT_UNITS)} were restarted "
+                            f"{(now - last_mqtt_restart) / 60:.0f} min ago (minimum gap "
+                            f"{RESTART_GAP / 60:.0f} min) -- holding. If this persists the fault "
+                            f"is beyond this machine.")
+                        mqtt_hold_logged = True
 
         for _ in range(CHECK_EVERY):
             if not running:
