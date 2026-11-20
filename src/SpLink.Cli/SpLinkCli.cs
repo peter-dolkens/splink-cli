@@ -87,6 +87,13 @@ internal static class SpLinkCli
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        // systemd and Docker stop a service with SIGTERM, not Ctrl-C. Left to the runtime's
+        // default, SIGTERM ends the process without unwinding, so the SP PRO never gets the
+        // disconnect notification and its single session is only freed when the socket drops.
+        // Treat it like Ctrl-C so `serve` disposes the session on the way out.
+        using var sigterm = System.Runtime.InteropServices.PosixSignalRegistration.Create(
+            System.Runtime.InteropServices.PosixSignal.SIGTERM,
+            context => { context.Cancel = true; cts.Cancel(); });
 
         try
         {
