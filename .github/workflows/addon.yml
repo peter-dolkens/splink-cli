@@ -1,0 +1,58 @@
+name: addon
+
+# Builds the Home Assistant add-on image the way the Supervisor does: the splink/ folder
+# as the build context, with the build args from build.yaml. Nothing is pushed; the
+# Supervisor builds its own copy on the device. Native runners per architecture, because
+# the .NET SDK under QEMU is slow and unreliable.
+on:
+  push:
+    branches: [main]
+    paths: ['splink/**', 'src/**', '.github/workflows/addon.yml']
+  pull_request:
+    paths: ['splink/**', 'src/**', '.github/workflows/addon.yml']
+  workflow_dispatch:
+
+jobs:
+  pin:
+    # The image ships src/ as of SPLINK_REF, not as of this commit. Say so when they differ.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check SPLINK_REF is current
+        run: |
+          ref=$(sed -n 's/^ *SPLINK_REF: *//p' splink/build.yaml)
+          git cat-file -e "$ref^{commit}" || { echo "::error::SPLINK_REF $ref is not in this repository"; exit 1; }
+          if ! git diff --quiet "$ref" HEAD -- src; then
+            echo "::warning file=splink/build.yaml::src/ has changed since SPLINK_REF $ref; the add-on still builds the old source"
+            git diff --stat "$ref" HEAD -- src
+          fi
+
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          ref=$(sed -n 's/^ *SPLINK_REF: *//p' splink/build.yaml)
+          version=$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' splink/config.yaml)
+          docker build splink -t splink-addon:${{ matrix.arch }} \
+            --build-arg SPLINK_REF="$ref" --build-arg BUILD_VERSION="$version" \
+            --build-arg BUILD_ARCH=${{ matrix.arch }}
+          docker images splink-addon:${{ matrix.arch }}
+      - name: Smoke test against the simulator
+        run: |
+          docker run -d --name sim -p 8080:8080 --entrypoint /opt/splink/splink \
+            splink-addon:${{ matrix.arch }} serve --simulate
+          for i in $(seq 30); do curl -sf localhost:8080/health && break; sleep 1; done
+          curl -sf localhost:8080/fast
+          docker stop sim
+          docker logs sim | tail -5

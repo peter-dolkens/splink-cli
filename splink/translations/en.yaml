@@ -1,0 +1,68 @@
+configuration:
+  connection:
+    name: Connection
+    description: >-
+      tcp for a serial-to-Ethernet adaptor (host and TCP port), serial for the SP PRO's
+      USB/serial port on this machine.
+  host:
+    name: Adaptor host
+    description: Host name or IP of the serial-to-TCP adaptor (connection tcp).
+  tcp_port:
+    name: Adaptor TCP port
+    description: The adaptor's port for the SP PRO serial stream (connection tcp).
+  serial_port:
+    name: Serial port
+    description: >-
+      Device path such as /dev/ttyACM0 or a /dev/serial/by-id/ path, or "auto" to pick
+      the only candidate port (connection serial).
+  baud:
+    name: Baud rate
+    description: Fixed serial baud rate. Leave empty to auto-detect.
+  password:
+    name: SP PRO password
+    description: Only if your SP PRO's login password is not the factory default.
+  http_port:
+    name: HTTP port
+    description: >-
+      Port of the JSON API inside the add-on network. Keep 8080 unless you also change
+      the port mapping.
+  fronius:
+    name: Fronius inverters
+    description: >-
+      Optional Fronius inverters to add through their Solar API, each a name and host.
+      Takes precedence over bridge_config.
+  bridge_config:
+    name: Bridge config file
+    description: >-
+      Optional bridge.json in this add-on's config folder (/addon_configs/<slug>/),
+      used when the Fronius list is empty.
+  idle_timeout:
+    name: Idle timeout (s)
+    description: Release the SP PRO link after this long without requests. Keep it above your poll interval.
+  live_interval:
+    name: Live data interval (s)
+    description: Minimum time between full live reads.
+  today_interval:
+    name: Today counters interval (s)
+  clock_interval:
+    name: Clock interval (s)
+  sweep_interval:
+    name: Block sweep interval (s)
+  log_interval:
+    name: Logged data interval (s)
+  fast_cache:
+    name: Fast cache (s)
+    description: How long a /fast reading is reused.
+  cache:
+    name: Response cache (s)
+    description: Optional override of the short cache every other endpoint answers from.
+  allow_raw:
+    name: Allow /raw
+    description: >-
+      Enable /raw (uncached register reads). It only answers requests from inside this
+      container, so leave it off unless you need it.
+  log_level:
+    name: Log level
+    description: debug hex-dumps every frame to the log. Very noisy.
+network:
+  8080/tcp: JSON API and /metrics (only needed outside the add-on network)

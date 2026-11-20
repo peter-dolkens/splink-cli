@@ -1,0 +1,72 @@
+# Home Assistant add-on manifest. Installs into a supervised HAOS instance.
+name: splink
+version: "0.1.0"
+slug: splink
+description: >-
+  Read-only bridge for a Selectronic SP PRO: serves its live data, today's
+  counters, clock and configuration as a JSON API and Prometheus /metrics to
+  other add-ons, over USB serial or a serial-to-TCP adaptor. Optionally adds
+  Fronius inverters through their Solar API.
+url: https://github.com/peter-dolkens/splink-cli/tree/main/splink
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: services
+boot: auto
+# Restart the add-on if the HTTP listener stops accepting connections. A plain TCP
+# check on purpose: /health returns 503 while the inverter is unreachable, and
+# restarting the process does not fix an unreachable inverter.
+watchdog: tcp://[HOST]:[PORT:8080]
+# USB setups: maps the host's serial devices into the container.
+uart: true
+# /config holds an optional bridge.json (Fronius list), see DOCS.md.
+map:
+  - addon_config:ro
+# Other add-ons reach the API on the internal network at http://<hostname>:8080/.
+# Not published on the host unless you set a host port here.
+ports:
+  8080/tcp: null
+ports_description:
+  8080/tcp: JSON API and /metrics (only needed outside Home Assistant's add-on network)
+
+options:
+  connection: tcp
+  host: ""
+  tcp_port: 6639
+  serial_port: auto
+  http_port: 8080
+  fronius: []
+  bridge_config: ""
+  idle_timeout: 300
+  live_interval: 120
+  today_interval: 600
+  clock_interval: 3600
+  sweep_interval: 1800
+  log_interval: 3600
+  fast_cache: 1
+  allow_raw: false
+  log_level: info
+
+schema:
+  connection: list(tcp|serial)
+  host: str?
+  tcp_port: port
+  serial_port: str?
+  baud: int?
+  password: password?
+  http_port: port
+  fronius:
+    - name: str
+      host: str
+  bridge_config: str?
+  idle_timeout: float(0,)
+  live_interval: float(0,)
+  today_interval: float(0,)
+  clock_interval: float(0,)
+  sweep_interval: float(0,)
+  log_interval: float(0,)
+  fast_cache: float(0,)
+  cache: float(0,)?
+  allow_raw: bool
+  log_level: list(info|debug)

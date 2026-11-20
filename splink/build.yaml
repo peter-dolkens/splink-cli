@@ -1,0 +1,9 @@
+# The Supervisor builds this add-on on the device. Its build context is this folder,
+# which does not contain the source, so the Dockerfile fetches the repository at
+# SPLINK_REF: the commit whose src/ this add-on version ships. Bump it (to a pushed
+# commit) whenever src/ changes; CI warns when it falls behind.
+build_from:
+  aarch64: mcr.microsoft.com/dotnet/runtime:10.0-alpine
+  amd64: mcr.microsoft.com/dotnet/runtime:10.0-alpine
+args:
+  SPLINK_REF: 353f114ee729080b243c395bd701b625b6efe403

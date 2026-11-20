@@ -56,6 +56,13 @@ Connect over USB/serial (`--port`, with auto-baud), an Ethernet serial adaptor
 (`--host`/`--tcp-port`), or remotely through a select.live gateway (`--select-live`).
 `--simulate` runs everything against a built-in simulated inverter, no hardware required.
 
+### Home Assistant add-on
+
+This repository is also a Home Assistant add-on repository. Add
+`https://github.com/peter-dolkens/splink-cli` under Settings → Add-ons → Add-on Store →
+Repositories and install **splink**: it runs `splink serve` on the add-on network, so
+other add-ons can read `http://<hostname>:8080/`. See [splink/DOCS.md](splink/DOCS.md).
+
 ## Modbus
 
 The SP PRO also has a vendor-documented Modbus RTU slave interface on its Advanced
@@ -104,6 +111,7 @@ src/SpLink.Cli         the splink command
 tests/                 132 tests, including a simulated inverter and a fake Fronius
 tools/                 scripts that mine register maps and label tables (see below)
 deploy/                provisioning for a Raspberry Pi bridge
+splink/                the Home Assistant add-on
 ```
 
 The register map, the 30 configuration enum tables, the 733 event labels and the display
