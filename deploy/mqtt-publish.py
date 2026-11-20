@@ -557,8 +557,13 @@ class Target:
         print(f"[{self.name}] disconnected", file=sys.stderr, flush=True)
 
     def connect(self):
-        self._client.connect(self.host, self.port, keepalive=60)
-        self._client.loop_start()
+        # loop_start must run even when the first connect raises: paho only retries from its
+        # network thread, so without it a refused first attempt (the tunnel listener not up yet
+        # when the watchdog restarts both units together) left the publisher dead for good.
+        try:
+            self._client.connect(self.host, self.port, keepalive=60)
+        finally:
+            self._client.loop_start()
 
     def announce(self, discovery):
         """Remember the entity set and publish it, so a later reconnect can replay it."""
